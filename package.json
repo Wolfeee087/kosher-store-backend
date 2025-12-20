@@ -1,0 +1,18 @@
+{
+  "name": "kosher-store-backend",
+  "version": "1.0.0",
+  "description": "Backend for Kosher Store - APK fetcher",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "google-play-scraper": "^9.1.1",
+    "axios": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
