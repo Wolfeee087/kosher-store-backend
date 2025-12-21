@@ -14,7 +14,7 @@ app.use(express.json());
 app.get('/', (req, res) => {
     res.json({
         status: 'Kosher Store Backend Running',
-        version: '3.1.0',
+        version: '3.3.0',
         endpoints: [
             '/app/:packageName',
             '/search/:query',
@@ -39,18 +39,21 @@ app.get('/search/:query', async (req, res) => {
     try {
         const results = await gplay.search({
             term: req.params.query,
-            num: 10
+            num: 15
         });
         
-        const simplified = results.map(app => ({
-            name: app.title,
-            packageName: app.appId,
-            developer: app.developer,
-            icon: app.icon,
-            rating: app.score,
-            installs: app.installs,
-            free: app.free
-        }));
+        const simplified = results
+            .filter(app => app.appId)
+            .slice(0, 10)
+            .map(app => ({
+                name: app.title,
+                packageName: app.appId,
+                developer: app.developer,
+                icon: app.icon,
+                rating: app.score,
+                installs: app.installs,
+                free: app.free
+            }));
         
         res.json({ success: true, results: simplified });
     } catch (error) {
@@ -114,14 +117,14 @@ app.get('/apk-url/:packageName', async (req, res) => {
             console.log(`  XAPK format also failed: ${xapkError.message}`);
         }
 
-        // Method 2: Try APKMirror search
+        // Method 3: Try APKMirror search
         console.log('Trying APKMirror...');
         let result = await tryApkMirror(packageName);
         if (result.success) {
             return res.json(result);
         }
 
-        // Method 3: APKCombo direct
+        // Method 4: APKCombo direct
         console.log('Trying APKCombo...');
         result = await tryApkCombo(packageName);
         if (result.success) {
@@ -216,7 +219,7 @@ async function tryApkCombo(packageName) {
     }
 }
 
-// Proxy download - streams APK through our server (BYPASSES BROWSER SECURITY RISK)
+// Proxy download - streams APK through our server
 app.get('/download-apk/:packageName', async (req, res) => {
     const packageName = req.params.packageName;
     
@@ -237,7 +240,7 @@ app.get('/download-apk/:packageName', async (req, res) => {
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive'
             },
-            timeout: 300000, // 5 min timeout for large files
+            timeout: 300000,
             maxRedirects: 10
         });
 
@@ -296,24 +299,26 @@ app.get('/search-with-apk/:query', async (req, res) => {
     try {
         const results = await gplay.search({
             term: req.params.query,
-            num: 10
+            num: 15
         });
         
-        const appsWithApk = results.map(app => ({
-            name: app.title,
-            packageName: app.appId,
-            developer: app.developer,
-            icon: app.icon,
-            rating: app.score,
-            installs: app.installs,
-            free: app.free,
-            // Include pre-built APK URLs
-            apkUrls: {
-                apkpure: `https://d.apkpure.com/b/XAPK/${app.appId}?version=latest`,
-                apkpureApk: `https://d.apkpure.com/b/APK/${app.appId}?version=latest`,
-                proxy: `https://kosher-store-backend.onrender.com/download-apk/${app.appId}`
-            }
-        }));
+        const appsWithApk = results
+            .filter(app => app.appId)
+            .slice(0, 10)
+            .map(app => ({
+                name: app.title,
+                packageName: app.appId,
+                developer: app.developer,
+                icon: app.icon,
+                rating: app.score,
+                installs: app.installs,
+                free: app.free,
+                apkUrls: {
+                    apkpure: `https://d.apkpure.com/b/XAPK/${app.appId}?version=latest`,
+                    apkpureApk: `https://d.apkpure.com/b/APK/${app.appId}?version=latest`,
+                    proxy: `https://kosher-store-backend.onrender.com/download-apk/${app.appId}`
+                }
+            }));
         
         res.json({ success: true, results: appsWithApk });
     } catch (error) {
@@ -322,5 +327,5 @@ app.get('/search-with-apk/:query', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Kosher Store Backend v3.1 running on port ${PORT}`);
+    console.log(`Kosher Store Backend v3.3 running on port ${PORT}`);
 });
