@@ -14,7 +14,7 @@ app.use(express.json());
 app.get('/', (req, res) => {
     res.json({
         status: 'Kosher Store Backend Running',
-        version: '3.3.0',
+        version: '3.4.0',
         endpoints: [
             '/app/:packageName',
             '/search/:query',
@@ -39,21 +39,27 @@ app.get('/search/:query', async (req, res) => {
     try {
         const results = await gplay.search({
             term: req.params.query,
-            num: 15
+            num: 10
         });
         
-        const simplified = results
-            .filter(app => app.appId)
-            .slice(0, 10)
-            .map(app => ({
+        const simplified = results.map(app => {
+            // Try to get packageName from appId, or extract from URL
+            let packageName = app.appId;
+            if (!packageName && app.url) {
+                const match = app.url.match(/id=([^&]+)/);
+                if (match) packageName = match[1];
+            }
+            
+            return {
                 name: app.title,
-                packageName: app.appId,
+                packageName: packageName || null,
                 developer: app.developer,
                 icon: app.icon,
                 rating: app.score,
                 installs: app.installs,
                 free: app.free
-            }));
+            };
+        });
         
         res.json({ success: true, results: simplified });
     } catch (error) {
@@ -157,12 +163,10 @@ async function tryApkMirror(packageName) {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         };
 
-        // Search for the app
         const searchUrl = `https://www.apkmirror.com/?post_type=app_release&searchtype=app&s=${packageName}`;
         const searchResp = await axios.get(searchUrl, { headers, timeout: 15000 });
         const $search = cheerio.load(searchResp.data);
         
-        // Find first app result
         const appLink = $search('div.appRow h5.appRowTitle a').first().attr('href');
         
         if (!appLink) {
@@ -194,7 +198,6 @@ async function tryApkCombo(packageName) {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         };
 
-        // Direct app page
         const appUrl = `https://apkcombo.com/app/${packageName}/`;
         console.log(`  Trying APKCombo: ${appUrl}`);
         
@@ -224,12 +227,10 @@ app.get('/download-apk/:packageName', async (req, res) => {
     const packageName = req.params.packageName;
     
     try {
-        // Use APKPure direct URL pattern
         const downloadUrl = `https://d.apkpure.com/b/XAPK/${packageName}?version=latest`;
         
         console.log(`Proxying APK download: ${downloadUrl}`);
         
-        // Stream the file through our server
         const response = await axios({
             method: 'GET',
             url: downloadUrl,
@@ -244,7 +245,6 @@ app.get('/download-apk/:packageName', async (req, res) => {
             maxRedirects: 10
         });
 
-        // Set headers for APK download
         res.setHeader('Content-Type', 'application/vnd.android.package-archive');
         res.setHeader('Content-Disposition', `attachment; filename="${packageName}.apk"`);
         
@@ -252,7 +252,6 @@ app.get('/download-apk/:packageName', async (req, res) => {
             res.setHeader('Content-Length', response.headers['content-length']);
         }
         
-        // Pipe the download to client
         response.data.pipe(res);
         
         response.data.on('error', (err) => {
@@ -265,7 +264,6 @@ app.get('/download-apk/:packageName', async (req, res) => {
     } catch (error) {
         console.error(`Proxy download error: ${error.message}`);
         
-        // Try APK format if XAPK failed
         try {
             const apkUrl = `https://d.apkpure.com/b/APK/${packageName}?version=latest`;
             console.log(`Trying APK format: ${apkUrl}`);
@@ -299,26 +297,31 @@ app.get('/search-with-apk/:query', async (req, res) => {
     try {
         const results = await gplay.search({
             term: req.params.query,
-            num: 15
+            num: 10
         });
         
-        const appsWithApk = results
-            .filter(app => app.appId)
-            .slice(0, 10)
-            .map(app => ({
+        const appsWithApk = results.map(app => {
+            let packageName = app.appId;
+            if (!packageName && app.url) {
+                const match = app.url.match(/id=([^&]+)/);
+                if (match) packageName = match[1];
+            }
+            
+            return {
                 name: app.title,
-                packageName: app.appId,
+                packageName: packageName || null,
                 developer: app.developer,
                 icon: app.icon,
                 rating: app.score,
                 installs: app.installs,
                 free: app.free,
-                apkUrls: {
-                    apkpure: `https://d.apkpure.com/b/XAPK/${app.appId}?version=latest`,
-                    apkpureApk: `https://d.apkpure.com/b/APK/${app.appId}?version=latest`,
-                    proxy: `https://kosher-store-backend.onrender.com/download-apk/${app.appId}`
-                }
-            }));
+                apkUrls: packageName ? {
+                    apkpure: `https://d.apkpure.com/b/XAPK/${packageName}?version=latest`,
+                    apkpureApk: `https://d.apkpure.com/b/APK/${packageName}?version=latest`,
+                    proxy: `https://kosher-store-backend.onrender.com/download-apk/${packageName}`
+                } : null
+            };
+        });
         
         res.json({ success: true, results: appsWithApk });
     } catch (error) {
@@ -327,5 +330,5 @@ app.get('/search-with-apk/:query', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Kosher Store Backend v3.3 running on port ${PORT}`);
+    console.log(`Kosher Store Backend v3.4 running on port ${PORT}`);
 });
