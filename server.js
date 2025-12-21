@@ -64,14 +64,36 @@ app.get('/apk-url/:packageName', async (req, res) => {
     console.log(`\n=== Fetching APK for: ${packageName} ===`);
     
     try {
-        // Method 1: APKPure Direct URL (MOST RELIABLE!)
-        // Pattern: https://d.apkpure.com/b/XAPK/{packageName}?version=latest
-        console.log('Trying APKPure direct URL...');
-        const apkPureDirectUrl = `https://d.apkpure.com/b/XAPK/${packageName}?version=latest`;
+        // Method 1: Try APK format FIRST (easier to install)
+        console.log('Trying APKPure APK format first...');
+        const apkPureApkUrl = `https://d.apkpure.com/b/APK/${packageName}?version=latest`;
         
-        // Verify the URL works
         try {
-            const headResp = await axios.head(apkPureDirectUrl, {
+            await axios.head(apkPureApkUrl, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                },
+                timeout: 10000,
+                maxRedirects: 5
+            });
+            console.log(`  ✓ APKPure APK format works!`);
+            return res.json({
+                success: true,
+                source: 'apkpure_direct',
+                downloadUrl: apkPureApkUrl,
+                packageName: packageName,
+                format: 'APK'
+            });
+        } catch (apkError) {
+            console.log(`  APK format failed: ${apkError.message}`);
+        }
+        
+        // Method 2: Try XAPK format (fallback)
+        console.log('Trying APKPure XAPK format...');
+        const apkPureXapkUrl = `https://d.apkpure.com/b/XAPK/${packageName}?version=latest`;
+        
+        try {
+            await axios.head(apkPureXapkUrl, {
                 headers: {
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
                 },
@@ -79,37 +101,17 @@ app.get('/apk-url/:packageName', async (req, res) => {
                 maxRedirects: 5
             });
             
-            // If we get here, URL is valid
-            console.log(`  ✓ APKPure direct URL works!`);
+            console.log(`  ✓ APKPure XAPK format works!`);
             return res.json({
                 success: true,
                 source: 'apkpure_direct',
-                downloadUrl: apkPureDirectUrl,
+                downloadUrl: apkPureXapkUrl,
                 packageName: packageName,
                 format: 'XAPK',
-                note: 'Direct download link - may be XAPK format (contains APK + OBB)'
+                note: 'XAPK format - needs extraction before install'
             });
-        } catch (headError) {
-            console.log(`  APKPure direct URL failed: ${headError.message}`);
-            
-            // Try APK format instead of XAPK
-            const apkPureApkUrl = `https://d.apkpure.com/b/APK/${packageName}?version=latest`;
-            try {
-                await axios.head(apkPureApkUrl, {
-                    headers: { 'User-Agent': 'Mozilla/5.0' },
-                    timeout: 10000
-                });
-                console.log(`  ✓ APKPure APK format works!`);
-                return res.json({
-                    success: true,
-                    source: 'apkpure_direct',
-                    downloadUrl: apkPureApkUrl,
-                    packageName: packageName,
-                    format: 'APK'
-                });
-            } catch (e) {
-                console.log(`  APK format also failed`);
-            }
+        } catch (xapkError) {
+            console.log(`  XAPK format also failed: ${xapkError.message}`);
         }
 
         // Method 2: Try APKMirror search
@@ -322,4 +324,3 @@ app.get('/search-with-apk/:query', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`Kosher Store Backend v3.1 running on port ${PORT}`);
 });
-
