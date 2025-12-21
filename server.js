@@ -14,7 +14,7 @@ app.use(express.json());
 app.get('/', (req, res) => {
     res.json({
         status: 'Kosher Store Backend Running',
-        version: '2.0.0',
+        version: '2.1.0',
         endpoints: [
             '/app/:packageName',
             '/search/:query',
@@ -64,153 +64,141 @@ app.get('/apk-url/:packageName', async (req, res) => {
     console.log(`Fetching APK URL for: ${packageName}`);
     
     try {
-        // Try APKPure first
-        let apkUrl = await getApkPureDirectUrl(packageName);
-        if (apkUrl) {
-            console.log(`Found APKPure URL: ${apkUrl}`);
+        // Try APKCombo first (most reliable)
+        let result = await getApkComboUrl(packageName);
+        if (result.url) {
+            console.log(`Found APKCombo URL: ${result.url}`);
             return res.json({ 
                 success: true, 
-                source: 'apkpure',
-                downloadUrl: apkUrl,
+                source: 'apkcombo',
+                downloadUrl: result.url,
+                version: result.version || '',
                 packageName: packageName
             });
         }
         
-        // Try APKMirror
-        apkUrl = await getApkMirrorUrl(packageName);
-        if (apkUrl) {
-            console.log(`Found APKMirror URL: ${apkUrl}`);
+        // Try direct APKPure download page
+        result = await getApkPureDownloadPage(packageName);
+        if (result.url) {
+            console.log(`Found APKPure page: ${result.url}`);
             return res.json({ 
                 success: true, 
-                source: 'apkmirror',
-                downloadUrl: apkUrl,
+                source: 'apkpure_page',
+                downloadUrl: result.url,
+                version: result.version || '',
                 packageName: packageName
             });
         }
-        
-        // Try Evozi APK Downloader as fallback
-        const evoziUrl = `https://apps.evozi.com/apk-downloader/?id=${packageName}`;
-        
+
+        // Return fallback URLs for manual download
         res.json({ 
-            success: false, 
-            error: 'Could not find direct APK URL',
-            fallbackUrl: evoziUrl,
-            message: 'Use the fallback URL to manually download'
+            success: true,
+            source: 'manual',
+            downloadUrl: `https://apkcombo.com/downloader/#package=${packageName}`,
+            fallbackUrls: {
+                apkcombo: `https://apkcombo.com/downloader/#package=${packageName}`,
+                apkpure: `https://apkpure.com/search?q=${packageName}`,
+                evozi: `https://apps.evozi.com/apk-downloader/?id=${packageName}`
+            },
+            packageName: packageName,
+            message: 'Use download page - direct link not available'
         });
         
     } catch (error) {
         console.error(`Error fetching APK: ${error.message}`);
-        res.json({ success: false, error: error.message });
+        res.json({ 
+            success: false, 
+            error: error.message,
+            fallbackUrls: {
+                apkcombo: `https://apkcombo.com/downloader/#package=${packageName}`,
+                apkpure: `https://apkpure.com/search?q=${packageName}`
+            }
+        });
     }
 });
 
-// Get APKPure direct download URL
-async function getApkPureDirectUrl(packageName) {
+// APKCombo - Try to get download page URL
+async function getApkComboUrl(packageName) {
     try {
-        // First get the app page
-        const appPageUrl = `https://apkpure.com/search?q=${packageName}`;
-        const searchResponse = await axios.get(appPageUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            },
-            timeout: 10000
-        });
+        // APKCombo has a nice URL structure
+        const downloadPageUrl = `https://apkcombo.com/downloader/#package=${packageName}`;
         
-        const $ = cheerio.load(searchResponse.data);
-        
-        // Find the app link that matches our package name
-        let appPath = null;
-        $('a.first-info').each((i, elem) => {
-            const href = $(elem).attr('href');
-            if (href && href.includes(packageName)) {
-                appPath = href;
-                return false; // break
-            }
-        });
-        
-        // Alternative: check dd.search-title a
-        if (!appPath) {
-            $('dd.search-title a').each((i, elem) => {
-                const href = $(elem).attr('href');
-                if (href) {
-                    appPath = href;
-                    return false;
-                }
-            });
-        }
-        
-        if (!appPath) {
-            console.log('APKPure: App page not found');
-            return null;
-        }
-        
-        // Now get the download page
-        const fullAppUrl = appPath.startsWith('http') ? appPath : `https://apkpure.com${appPath}`;
-        console.log(`APKPure app URL: ${fullAppUrl}`);
-        
-        const appResponse = await axios.get(`${fullAppUrl}/download`, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            },
-            timeout: 10000
-        });
-        
-        const $app = cheerio.load(appResponse.data);
-        
-        // Look for download link
-        let downloadUrl = $app('a#download_link').attr('href');
-        
-        if (!downloadUrl) {
-            downloadUrl = $app('a.download-start-btn').attr('href');
-        }
-        
-        if (!downloadUrl) {
-            // Try to find any APK download link
-            $app('a').each((i, elem) => {
-                const href = $app(elem).attr('href');
-                if (href && href.includes('.apk')) {
-                    downloadUrl = href;
-                    return false;
-                }
-            });
-        }
-        
-        return downloadUrl || null;
-        
-    } catch (error) {
-        console.error(`APKPure error: ${error.message}`);
-        return null;
-    }
-}
-
-// Get APKMirror URL (returns page URL, not direct download due to their protection)
-async function getApkMirrorUrl(packageName) {
-    try {
-        const searchUrl = `https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s=${packageName}`;
+        // Try to find the app page first
+        const searchUrl = `https://apkcombo.com/search/${packageName}`;
         const response = await axios.get(searchUrl, {
             headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5'
             },
-            timeout: 10000
+            timeout: 15000
         });
         
         const $ = cheerio.load(response.data);
         
-        // Find first result
-        const firstResult = $('div.appRow a.fontBlack').first().attr('href');
-        
-        if (firstResult) {
-            return `https://www.apkmirror.com${firstResult}`;
+        // Find app link
+        let appUrl = null;
+        $('a.content').each((i, elem) => {
+            const href = $(elem).attr('href');
+            if (href && href.includes(packageName.split('.').pop())) {
+                appUrl = href;
+                return false;
+            }
+        });
+
+        // If we found the app page, construct download URL
+        if (appUrl) {
+            const fullUrl = appUrl.startsWith('http') ? appUrl : `https://apkcombo.com${appUrl}`;
+            return { url: `${fullUrl}/download/apk`, version: '' };
         }
         
-        return null;
+        // Return the downloader page as fallback
+        return { url: downloadPageUrl, version: '' };
+        
     } catch (error) {
-        console.error(`APKMirror error: ${error.message}`);
-        return null;
+        console.error(`APKCombo error: ${error.message}`);
+        return { url: null };
     }
 }
 
-// Legacy endpoint - returns multiple download options
+// APKPure - Get download page URL
+async function getApkPureDownloadPage(packageName) {
+    try {
+        // Construct direct URL to app
+        const appName = packageName.split('.').pop();
+        const possibleUrls = [
+            `https://apkpure.com/${appName}/${packageName}/download`,
+            `https://apkpure.com/app/${packageName}/download`
+        ];
+        
+        for (const url of possibleUrls) {
+            try {
+                const response = await axios.head(url, {
+                    headers: {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    },
+                    timeout: 5000,
+                    maxRedirects: 5
+                });
+                
+                if (response.status === 200) {
+                    return { url: url, version: '' };
+                }
+            } catch (e) {
+                // Try next URL
+            }
+        }
+        
+        // Return search page
+        return { url: `https://apkpure.com/search?q=${packageName}`, version: '' };
+        
+    } catch (error) {
+        console.error(`APKPure error: ${error.message}`);
+        return { url: null };
+    }
+}
+
+// Legacy endpoint - returns download page URLs
 app.get('/download/:packageName', async (req, res) => {
     const packageName = req.params.packageName;
     
@@ -218,20 +206,21 @@ app.get('/download/:packageName', async (req, res) => {
         // Get app info first
         const appInfo = await gplay.app({ appId: packageName }).catch(() => null);
         
-        // Try to get direct APK URL
-        let directUrl = await getApkPureDirectUrl(packageName);
+        // Get best download URL
+        let downloadResult = await getApkComboUrl(packageName);
         
         res.json({
             success: true,
             app: appInfo ? {
                 name: appInfo.title,
                 version: appInfo.version,
-                size: appInfo.size
+                size: appInfo.size,
+                icon: appInfo.icon
             } : null,
-            directApkUrl: directUrl,
-            downloadUrls: {
+            downloadUrl: downloadResult.url,
+            downloadPages: {
+                apkcombo: `https://apkcombo.com/downloader/#package=${packageName}`,
                 apkpure: `https://apkpure.com/search?q=${packageName}`,
-                apkmirror: `https://www.apkmirror.com/?s=${packageName}`,
                 evozi: `https://apps.evozi.com/apk-downloader/?id=${packageName}`
             }
         });
@@ -240,7 +229,7 @@ app.get('/download/:packageName', async (req, res) => {
     }
 });
 
-// Search and return apps with APK availability info
+// Search and get download URLs for results
 app.get('/search-with-apk/:query', async (req, res) => {
     try {
         const results = await gplay.search({
@@ -248,28 +237,23 @@ app.get('/search-with-apk/:query', async (req, res) => {
             num: 5
         });
         
-        // For each result, check if we can get an APK URL
-        const appsWithApk = await Promise.all(results.map(async (app) => {
-            const apkUrl = await getApkPureDirectUrl(app.appId).catch(() => null);
-            return {
-                name: app.title,
-                packageName: app.appId,
-                developer: app.developer,
-                icon: app.icon,
-                rating: app.score,
-                installs: app.installs,
-                free: app.free,
-                apkAvailable: !!apkUrl,
-                apkUrl: apkUrl
-            };
+        const appsWithDownload = results.map(app => ({
+            name: app.title,
+            packageName: app.appId,
+            developer: app.developer,
+            icon: app.icon,
+            rating: app.score,
+            installs: app.installs,
+            free: app.free,
+            downloadUrl: `https://apkcombo.com/downloader/#package=${app.appId}`
         }));
         
-        res.json({ success: true, results: appsWithApk });
+        res.json({ success: true, results: appsWithDownload });
     } catch (error) {
         res.json({ success: false, error: error.message });
     }
 });
 
 app.listen(PORT, () => {
-    console.log(`Kosher Store Backend running on port ${PORT}`);
+    console.log(`Kosher Store Backend v2.1 running on port ${PORT}`);
 });

@@ -1,6 +1,6 @@
 {
   "name": "kosher-store-backend",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Backend for Kosher Store - fetches app info and APK URLs",
   "main": "server.js",
   "scripts": {
