@@ -1,7 +1,7 @@
 {
   "name": "kosher-store-backend",
-  "version": "1.0.0",
-  "description": "Backend for Kosher Store - APK fetcher",
+  "version": "2.0.0",
+  "description": "Backend for Kosher Store - fetches app info and APK URLs",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,7 +10,8 @@
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "google-play-scraper": "^9.1.1",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12"
   },
   "engines": {
     "node": ">=18.0.0"
