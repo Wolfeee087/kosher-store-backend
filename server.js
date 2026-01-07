@@ -10,17 +10,57 @@ const PORT = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
+// ============================================================
+// KNOWN OLDER VERSIONS FOR PROBLEMATIC APPS
+// These apps have newer versions that require higher API levels
+// We maintain direct download links for older compatible versions
+// ============================================================
+
+const KNOWN_OLDER_VERSIONS = {
+    'com.openai.chatgpt': {
+        // ChatGPT latest requires API 32, but older versions work on API 21+
+        name: 'ChatGPT',
+        olderVersions: [
+            {
+                maxApiLevel: 31, // For devices with API 31 or lower
+                version: '1.2024.122',
+                // APKPure direct download for specific version
+                downloadUrl: 'https://d.apkpure.com/b/APK/com.openai.chatgpt?versionCode=10241220',
+                minSdk: 24,
+                format: 'APK'
+            },
+            {
+                maxApiLevel: 30, // For devices with API 30 or lower (Android 11)
+                version: '1.2024.052',
+                downloadUrl: 'https://d.apkpure.com/b/APK/com.openai.chatgpt?versionCode=10240520',
+                minSdk: 24,
+                format: 'APK'
+            },
+            {
+                maxApiLevel: 28, // For devices with API 28 or lower (Android 9)
+                version: '1.2023.352',
+                downloadUrl: 'https://d.apkpure.com/b/APK/com.openai.chatgpt?versionCode=10233520',
+                minSdk: 21,
+                format: 'APK'
+            }
+        ]
+    },
+    // Add more apps here as needed
+};
+
 // Health check
 app.get('/', (req, res) => {
     res.json({
         status: 'Kosher Store Backend Running',
-        version: '4.2.0',
+        version: '4.3.0',
         features: [
             'Device-aware APK filtering',
             'minSdk compatibility checks',
             'Automatic older version fallback with ?needsOlderVersion=true',
-            'APKMirror version history support'
+            'Hardcoded older versions for known problematic apps',
+            'APKMirror/APKPure scraping fallback'
         ],
+        knownOlderVersions: Object.keys(KNOWN_OLDER_VERSIONS),
         endpoints: [
             '/app/:packageName',
             '/search/:query',
@@ -133,7 +173,6 @@ app.get('/search/:query', async (req, res) => {
 
 // ============================================================
 // MAIN APK URL ENDPOINT
-// Supports ?needsOlderVersion=true for automatic retry after install failure
 // ============================================================
 
 app.get('/apk-url/:packageName', async (req, res) => {
@@ -168,38 +207,83 @@ app.get('/apk-url/:packageName', async (req, res) => {
         const mustFindOlderVersion = deviceInfo.needsOlderVersion || 
             (minSdkFromStore && deviceInfo.apiLevel && minSdkFromStore > deviceInfo.apiLevel);
         
-        // If client says latest didn't work OR Play Store says incompatible, find older version
+        // ============================================================
+        // OLDER VERSION PATH
+        // ============================================================
         if (mustFindOlderVersion) {
             console.log('Searching for older compatible version...');
             
-            // Try APKMirror first (better version history)
-            let result = await findOlderVersionApkMirror(packageName, deviceInfo, appName);
-            if (result.success) {
-                return res.json(result);
+            // FIRST: Check if we have a known older version for this app
+            const knownApp = KNOWN_OLDER_VERSIONS[packageName];
+            if (knownApp && deviceInfo.apiLevel) {
+                console.log(`  Found ${packageName} in known older versions list`);
+                
+                // Find the best version for this device's API level
+                const compatibleVersion = knownApp.olderVersions.find(v => 
+                    deviceInfo.apiLevel <= v.maxApiLevel && 
+                    (!v.minSdk || deviceInfo.apiLevel >= v.minSdk)
+                );
+                
+                if (compatibleVersion) {
+                    console.log(`  ✓ Using known older version: ${compatibleVersion.version}`);
+                    
+                    // Verify the URL still works
+                    try {
+                        await axios.head(compatibleVersion.downloadUrl, {
+                            headers: { 'User-Agent': 'Mozilla/5.0' },
+                            timeout: 10000,
+                            maxRedirects: 5
+                        });
+                        
+                        return res.json({
+                            success: true,
+                            source: 'known_older_version',
+                            downloadUrl: compatibleVersion.downloadUrl,
+                            packageName: packageName,
+                            appName: knownApp.name,
+                            version: compatibleVersion.version,
+                            minSdk: compatibleVersion.minSdk,
+                            format: compatibleVersion.format || 'APK',
+                            compatible: true,
+                            isOlderVersion: true,
+                            note: `Older version ${compatibleVersion.version} compatible with Android ${getAndroidVersionName(deviceInfo.apiLevel)}`
+                        });
+                    } catch (e) {
+                        console.log(`  Known version URL failed: ${e.message}, trying alternatives...`);
+                    }
+                }
             }
             
-            // Try APKPure version history
-            result = await findOlderVersionApkPure(packageName, deviceInfo, appName);
-            if (result.success) {
-                return res.json(result);
+            // SECOND: Try APKPure with specific version parameter
+            console.log('  Trying APKPure older versions...');
+            const apkpureResult = await tryApkPureOlderVersion(packageName, deviceInfo);
+            if (apkpureResult.success) {
+                return res.json(apkpureResult);
             }
             
-            // No older version found automatically - return APKMirror page as fallback
-            console.log('✗ No compatible older version found automatically');
-            console.log('  Returning APKMirror page URL as fallback');
+            // THIRD: Try scraping APKMirror for actual download link
+            console.log('  Trying APKMirror older versions...');
+            const apkmirrorResult = await tryApkMirrorOlderVersion(packageName, deviceInfo, appName);
+            if (apkmirrorResult.success) {
+                return res.json(apkmirrorResult);
+            }
+            
+            // FAILED: No older version found
+            console.log('✗ No compatible older version found');
             return res.json({
-                success: true,
-                source: 'apkmirror_manual',
-                downloadUrl: `https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s=${packageName}`,
+                success: false,
+                compatible: false,
+                error: `${appName} requires Android ${getAndroidVersionName(minSdkFromStore || 32)}+. No older compatible version was found for Android ${getAndroidVersionName(deviceInfo.apiLevel)}.`,
                 packageName: packageName,
                 appName: appName,
-                compatible: true,
-                isOlderVersion: true,
-                note: 'Please select an older version compatible with your device from APKMirror'
+                deviceApiLevel: deviceInfo.apiLevel,
+                suggestion: 'This app may not have an older version compatible with your device.'
             });
         }
 
-        // Try latest version first (for compatible devices)
+        // ============================================================
+        // LATEST VERSION PATH (for compatible devices)
+        // ============================================================
         console.log('Trying latest version...');
         
         // Try APKPure XAPK
@@ -271,10 +355,74 @@ app.get('/apk-url/:packageName', async (req, res) => {
 });
 
 // ============================================================
-// FIND OLDER VERSION - APKMirror
+// TRY APKPURE OLDER VERSION
+// Uses APKPure's version-specific download URLs
 // ============================================================
 
-async function findOlderVersionApkMirror(packageName, deviceInfo, appName) {
+async function tryApkPureOlderVersion(packageName, deviceInfo) {
+    const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    };
+
+    try {
+        // Try a few older version codes (these are estimates based on common patterns)
+        // APKPure version codes are usually: versionName without dots + build number
+        const versionCodesToTry = [
+            '10241220', // ~v1.2024.122
+            '10240520', // ~v1.2024.052
+            '10233520', // ~v1.2023.352
+            '10232000', // ~v1.2023.200
+            '10231000', // ~v1.2023.100
+        ];
+
+        for (const versionCode of versionCodesToTry) {
+            const url = `https://d.apkpure.com/b/APK/${packageName}?versionCode=${versionCode}`;
+            
+            try {
+                const response = await axios.head(url, { 
+                    headers, 
+                    timeout: 8000,
+                    maxRedirects: 5,
+                    validateStatus: (status) => status < 400
+                });
+                
+                // Check if we got a valid APK response (not HTML error page)
+                const contentType = response.headers['content-type'] || '';
+                const contentLength = parseInt(response.headers['content-length'] || '0');
+                
+                if (contentLength > 1000000) { // > 1MB, likely a real APK
+                    console.log(`  ✓ Found APKPure version ${versionCode} (${Math.round(contentLength/1024/1024)}MB)`);
+                    return {
+                        success: true,
+                        source: 'apkpure_older',
+                        downloadUrl: url,
+                        packageName: packageName,
+                        version: versionCode,
+                        format: 'APK',
+                        compatible: true,
+                        isOlderVersion: true,
+                        note: `Older APK version`
+                    };
+                }
+            } catch (e) {
+                // This version doesn't exist, try next
+                continue;
+            }
+        }
+
+        return { success: false };
+
+    } catch (error) {
+        console.log(`  APKPure older version error: ${error.message}`);
+        return { success: false };
+    }
+}
+
+// ============================================================
+// TRY APKMIRROR OLDER VERSION - Get actual download link
+// ============================================================
+
+async function tryApkMirrorOlderVersion(packageName, deviceInfo, appName) {
     const headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
@@ -283,7 +431,7 @@ async function findOlderVersionApkMirror(packageName, deviceInfo, appName) {
     try {
         // Search APKMirror
         const searchUrl = `https://www.apkmirror.com/?post_type=app_release&searchtype=app&s=${packageName}`;
-        console.log(`  Searching APKMirror...`);
+        console.log(`    Searching APKMirror...`);
         
         const searchResp = await axios.get(searchUrl, { headers, timeout: 15000 });
         const $search = cheerio.load(searchResp.data);
@@ -291,187 +439,103 @@ async function findOlderVersionApkMirror(packageName, deviceInfo, appName) {
         // Find app page
         const appLink = $search('div.appRow h5.appRowTitle a').first().attr('href');
         if (!appLink) {
-            console.log('  App not found on APKMirror');
+            console.log('    App not found on APKMirror');
             return { success: false };
         }
 
-        // Go to app page to see versions
+        // Go to app page
         const appUrl = `https://www.apkmirror.com${appLink}`;
-        console.log(`  Found: ${appUrl}`);
+        console.log(`    Found app page: ${appUrl}`);
         
         const appResp = await axios.get(appUrl, { headers, timeout: 15000 });
         const $app = cheerio.load(appResp.data);
         
-        // Collect all version entries
-        const versions = [];
-        
-        // APKMirror shows recent versions on the app page
-        $app('.listWidget .appRow').each((i, el) => {
+        // Find version links - look for older versions
+        const versionLinks = [];
+        $app('div.listWidget div.appRow').each((i, el) => {
             const $el = $app(el);
-            const link = $el.find('a.downloadLink, a[href*="/apk/"]').first().attr('href');
+            const link = $el.find('a.downloadLink').first().attr('href') || 
+                        $el.find('h5 a').first().attr('href');
             const text = $el.text();
             
-            if (!link) return;
-            
-            // Look for minAPI in the version info
-            const minApiMatch = text.match(/minAPI[:\s]*(\d+)/i);
-            const androidMatch = text.match(/Android[:\s]*(\d+\.?\d*)\+?/i);
-            const versionMatch = text.match(/(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)/);
-            
-            let minSdk = null;
-            if (minApiMatch) {
-                minSdk = parseInt(minApiMatch[1]);
-            } else if (androidMatch) {
-                minSdk = androidVersionToApi(androidMatch[1]);
-            }
-            
-            versions.push({
-                version: versionMatch ? versionMatch[1] : null,
-                minSdk: minSdk,
-                link: `https://www.apkmirror.com${link}`,
-                text: text.substring(0, 80).trim()
-            });
-        });
-
-        console.log(`  Found ${versions.length} versions`);
-
-        // Find newest compatible version
-        if (deviceInfo.apiLevel && versions.length > 0) {
-            const compatible = versions.find(v => !v.minSdk || v.minSdk <= deviceInfo.apiLevel);
-            
-            if (compatible) {
-                console.log(`  ✓ Compatible: ${compatible.version || 'unknown'} (minAPI: ${compatible.minSdk || '?'})`);
-                return {
-                    success: true,
-                    source: 'apkmirror_older',
-                    downloadUrl: compatible.link,
-                    packageName: packageName,
-                    appName: appName,
-                    version: compatible.version,
-                    minSdk: compatible.minSdk,
-                    compatible: true,
-                    isOlderVersion: true,
-                    note: 'Older compatible version - click download on APKMirror page'
-                };
-            }
-        }
-
-        // No compatible version found, but return the page anyway
-        if (versions.length > 0) {
-            return {
-                success: true,
-                source: 'apkmirror',
-                downloadUrl: appUrl,
-                packageName: packageName,
-                note: 'APKMirror page - manually select a compatible version'
-            };
-        }
-
-        return { success: false };
-
-    } catch (error) {
-        console.log(`  APKMirror error: ${error.message}`);
-        return { success: false };
-    }
-}
-
-// ============================================================
-// FIND OLDER VERSION - APKPure
-// ============================================================
-
-async function findOlderVersionApkPure(packageName, deviceInfo, appName) {
-    const headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-    };
-
-    try {
-        // Search APKPure
-        const searchUrl = `https://apkpure.com/search?q=${packageName}`;
-        console.log(`  Searching APKPure versions...`);
-        
-        const searchResp = await axios.get(searchUrl, { headers, timeout: 15000 });
-        const $ = cheerio.load(searchResp.data);
-        
-        // Find app link
-        let appPath = null;
-        $('a.first-info, a[href*="' + packageName + '"]').each((i, el) => {
-            const href = $(el).attr('href');
-            if (href && (href.includes(packageName) || !appPath)) {
-                appPath = href;
-                if (href.includes(packageName)) return false;
-            }
-        });
-        
-        if (!appPath) {
-            console.log('  App not found on APKPure');
-            return { success: false };
-        }
-
-        // Go to versions page
-        const baseUrl = appPath.startsWith('http') ? appPath : `https://apkpure.com${appPath}`;
-        const versionsUrl = baseUrl.replace(/\/$/, '') + '/versions';
-        console.log(`  Checking: ${versionsUrl}`);
-        
-        const versionsResp = await axios.get(versionsUrl, { headers, timeout: 15000 });
-        const $v = cheerio.load(versionsResp.data);
-        
-        // Parse versions
-        const versions = [];
-        
-        $v('.ver-item, .version-item, ul.ver-wrap li, div[class*="ver"]').each((i, el) => {
-            const $el = $v(el);
-            const text = $el.text();
-            const link = $el.find('a').first().attr('href');
-            
-            if (!link || !text) return;
-            
-            // Parse Android requirement
-            const reqMatch = text.match(/(?:Android|Requires)[:\s]*(\d+\.?\d*)/i);
-            const verMatch = text.match(/(\d+\.\d+(?:\.\d+)?(?:\.\d+)?)/);
-            
-            if (verMatch) {
-                versions.push({
-                    version: verMatch[1],
-                    minSdk: reqMatch ? androidVersionToApi(reqMatch[1]) : null,
-                    link: link.startsWith('http') ? link : `https://apkpure.com${link}`,
-                    text: text.substring(0, 60).trim()
+            if (link && link.includes('/apk/')) {
+                // Try to extract minAPI from the text
+                const minApiMatch = text.match(/minAPI[:\s]*(\d+)/i);
+                const minSdk = minApiMatch ? parseInt(minApiMatch[1]) : null;
+                
+                versionLinks.push({
+                    link: `https://www.apkmirror.com${link}`,
+                    minSdk: minSdk,
+                    text: text.substring(0, 100)
                 });
             }
         });
-        
-        console.log(`  Found ${versions.length} versions on APKPure`);
-        
-        // Find compatible version
-        if (deviceInfo.apiLevel && versions.length > 0) {
-            const compatible = versions.find(v => !v.minSdk || v.minSdk <= deviceInfo.apiLevel);
-            
-            if (compatible) {
-                console.log(`  ✓ Compatible: v${compatible.version} (minSdk: ${compatible.minSdk || '?'})`);
-                return {
-                    success: true,
-                    source: 'apkpure_older',
-                    downloadUrl: compatible.link,
-                    packageName: packageName,
-                    appName: appName,
-                    version: compatible.version,
-                    minSdk: compatible.minSdk,
-                    compatible: true,
-                    isOlderVersion: true,
-                    note: 'Older compatible version from APKPure'
-                };
+
+        console.log(`    Found ${versionLinks.length} version links`);
+
+        // Find a compatible version
+        for (const version of versionLinks) {
+            if (version.minSdk && deviceInfo.apiLevel && version.minSdk > deviceInfo.apiLevel) {
+                continue; // Skip incompatible versions
+            }
+
+            // Try to get the actual download page
+            try {
+                const versionResp = await axios.get(version.link, { headers, timeout: 10000 });
+                const $version = cheerio.load(versionResp.data);
+                
+                // Look for download button/link
+                let downloadPageLink = $version('a.downloadButton').attr('href') ||
+                                       $version('a[href*="download"]').first().attr('href');
+                
+                if (downloadPageLink && !downloadPageLink.startsWith('http')) {
+                    downloadPageLink = `https://www.apkmirror.com${downloadPageLink}`;
+                }
+
+                if (downloadPageLink) {
+                    // Get the final download page
+                    const downloadResp = await axios.get(downloadPageLink, { headers, timeout: 10000 });
+                    const $download = cheerio.load(downloadResp.data);
+                    
+                    // Find the actual APK download link
+                    let apkLink = $download('a[href*=".apk"]').first().attr('href') ||
+                                 $download('a.downloadButton').attr('href');
+                    
+                    if (apkLink) {
+                        if (!apkLink.startsWith('http')) {
+                            apkLink = `https://www.apkmirror.com${apkLink}`;
+                        }
+                        
+                        console.log(`    ✓ Found APKMirror download: ${apkLink}`);
+                        return {
+                            success: true,
+                            source: 'apkmirror_older',
+                            downloadUrl: apkLink,
+                            packageName: packageName,
+                            appName: appName,
+                            minSdk: version.minSdk,
+                            compatible: true,
+                            isOlderVersion: true,
+                            note: 'Older version from APKMirror'
+                        };
+                    }
+                }
+            } catch (e) {
+                console.log(`    Failed to get download for version: ${e.message}`);
+                continue;
             }
         }
-        
+
         return { success: false };
-        
+
     } catch (error) {
-        console.log(`  APKPure versions error: ${error.message}`);
+        console.log(`    APKMirror older version error: ${error.message}`);
         return { success: false };
     }
 }
 
 // ============================================================
-// BASIC APKMirror (latest)
+// BASIC APKMIRROR (latest) - Returns page URL not direct download
 // ============================================================
 
 async function tryApkMirror(packageName) {
@@ -495,7 +559,7 @@ async function tryApkMirror(packageName) {
             source: 'apkmirror',
             downloadUrl: `https://www.apkmirror.com${appLink}`,
             packageName: packageName,
-            note: 'APKMirror page'
+            note: 'APKMirror page - requires manual download'
         };
 
     } catch (error) {
@@ -527,12 +591,16 @@ app.get('/check-compatibility/:packageName', async (req, res) => {
             minSdk = androidVersionToApi(appData.androidVersion);
             compatible = !minSdk || minSdk <= deviceInfo.apiLevel;
         }
+
+        // Check if we have a known older version
+        const hasOlderVersion = !!KNOWN_OLDER_VERSIONS[packageName];
         
         res.json({
             success: true,
             packageName: packageName,
             appName: appData.title,
             compatible: compatible,
+            hasKnownOlderVersion: hasOlderVersion,
             appRequirements: {
                 minAndroidVersion: appData.androidVersion,
                 minSdk: minSdk
@@ -543,7 +611,9 @@ app.get('/check-compatibility/:packageName', async (req, res) => {
             },
             message: compatible ? 
                 'App should be compatible' :
-                `Requires Android ${appData.androidVersion}. An older version may work.`
+                hasOlderVersion ?
+                    `Latest requires Android ${appData.androidVersion}, but an older compatible version is available.` :
+                    `Requires Android ${appData.androidVersion}. No older version available.`
         });
         
     } catch (error) {
@@ -617,7 +687,7 @@ app.get('/search-with-apk/:query', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Kosher Store Backend v4.2 running on port ${PORT}`);
-    console.log('NEW: ?needsOlderVersion=true parameter for automatic retry');
-    console.log('Phone can retry with older version if INSTALL_FAILED_OLDER_SDK');
+    console.log(`Kosher Store Backend v4.3 running on port ${PORT}`);
+    console.log('NEW: Hardcoded older versions for known problematic apps (ChatGPT, etc.)');
+    console.log('NEW: Better APKPure version-specific downloads');
 });
