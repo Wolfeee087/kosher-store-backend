@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const gplay = require('google-play-scraper');
 const axios = require('axios');
+const admin = require('firebase-admin');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -10,23 +11,39 @@ app.use(cors());
 app.use(express.json());
 
 // ============================================================
-// OLDER VERSIONS DATABASE
-// Manually maintained list of working older version URLs
+// FIREBASE ADMIN INITIALIZATION
 // ============================================================
 
-const OLDER_VERSIONS_DB = {
-    'com.openai.chatgpt': {
-        name: 'ChatGPT',
-        latestRequiresApi: 32,
-        olderVersions: [
-            // These are version codes for APKPure downloads
-            // Format: versionCode that works with d.apkpure.net
-            { version: '1.2024.311', minApi: 24, maxApi: 31, versionCode: '10243110' },
-            { version: '1.2024.220', minApi: 24, maxApi: 30, versionCode: '10242200' },
-            { version: '1.2024.150', minApi: 21, maxApi: 29, versionCode: '10241500' }
-        ]
+let firebaseInitialized = false;
+
+function initFirebase() {
+    if (firebaseInitialized) return;
+    
+    try {
+        // Initialize with environment variable or service account
+        if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+            const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+            admin.initializeApp({
+                credential: admin.credential.cert(serviceAccount),
+                databaseURL: process.env.FIREBASE_DATABASE_URL || 'https://yeshiva-filter-default-rtdb.firebaseio.com'
+            });
+        } else if (process.env.FIREBASE_DATABASE_URL) {
+            // For environments where default credentials work
+            admin.initializeApp({
+                databaseURL: process.env.FIREBASE_DATABASE_URL
+            });
+        } else {
+            console.log('⚠️ Firebase not configured - override system disabled');
+            return;
+        }
+        firebaseInitialized = true;
+        console.log('✅ Firebase Admin initialized');
+    } catch (e) {
+        console.log('⚠️ Firebase init failed:', e.message);
     }
-};
+}
+
+initFirebase();
 
 // ============================================================
 // HEALTH CHECK
@@ -35,14 +52,20 @@ const OLDER_VERSIONS_DB = {
 app.get('/', (req, res) => {
     res.json({
         status: 'Kosher Store Backend Running',
-        version: '4.5.0',
+        version: '5.0.0',
         features: [
+            'Manual APK override system (Firebase-based)',
             'Device-aware APK filtering',
-            'Automatic older version fallback',
-            'Proxy download for older versions',
-            'Hardcoded older versions for known apps'
+            'Override logging and statistics',
+            'Fallback to APKPure for non-overridden apps'
         ],
-        knownAppsWithOlderVersions: Object.keys(OLDER_VERSIONS_DB)
+        firebaseConnected: firebaseInitialized,
+        endpoints: [
+            'GET /apk-url/:packageName?apiLevel=30&model=F21&manufacturer=DuoQin',
+            'GET /overrides - List all overrides',
+            'POST /override/verify - Verify an APK URL',
+            'POST /override/log - Log install result'
+        ]
     });
 });
 
@@ -54,6 +77,9 @@ function getDeviceInfo(req) {
     return {
         apiLevel: parseInt(req.query.apiLevel) || null,
         arch: req.query.arch || null,
+        model: req.query.model || null,
+        manufacturer: req.query.manufacturer || null,
+        deviceId: req.query.deviceId || null,
         needsOlderVersion: req.query.needsOlderVersion === 'true'
     };
 }
@@ -67,27 +93,6 @@ function getAndroidVersionName(apiLevel) {
     return versions[apiLevel] || String(apiLevel);
 }
 
-function androidVersionToApi(versionStr) {
-    if (!versionStr) return null;
-    const mapping = {
-        '5.0': 21, '6.0': 23, '7.0': 24, '8.0': 26, '8.1': 27,
-        '9': 28, '10': 29, '11': 30, '12': 31, '13': 33, '14': 34
-    };
-    if (mapping[versionStr]) return mapping[versionStr];
-    const num = parseFloat(versionStr);
-    if (num >= 14) return 34;
-    if (num >= 13) return 33;
-    if (num >= 12) return 31;
-    if (num >= 11) return 30;
-    if (num >= 10) return 29;
-    if (num >= 9) return 28;
-    if (num >= 8) return 26;
-    if (num >= 7) return 24;
-    if (num >= 6) return 23;
-    if (num >= 5) return 21;
-    return null;
-}
-
 // ============================================================
 // MAIN APK URL ENDPOINT
 // ============================================================
@@ -96,82 +101,59 @@ app.get('/apk-url/:packageName', async (req, res) => {
     const packageName = req.params.packageName;
     const deviceInfo = getDeviceInfo(req);
     
-    console.log(`\n=== APK: ${packageName} | API: ${deviceInfo.apiLevel} | needsOlder: ${deviceInfo.needsOlderVersion} ===`);
+    console.log(`\n=== APK Request: ${packageName} ===`);
+    console.log(`Device: ${deviceInfo.manufacturer || '?'} ${deviceInfo.model || '?'}, API ${deviceInfo.apiLevel}`);
     
     try {
-        // Get app info from Play Store
+        // ============================================================
+        // STEP 1: Check for manual override in Firebase (if configured)
+        // Only returns if there's a MATCHING override for this device
+        // Otherwise falls through to normal APKPure search
+        // ============================================================
+        if (firebaseInitialized) {
+            const override = await findMatchingOverride(packageName, deviceInfo);
+            
+            if (override) {
+                console.log(`✅ Override matched: ${override.appName} v${override.override.version}`);
+                console.log(`   Target: API ${override.targeting?.minApiLevel || '*'}-${override.targeting?.maxApiLevel || '*'}, Models: ${override.targeting?.deviceModels?.join(',') || '*'}`);
+                
+                // Log the usage
+                await logOverrideUsage(override.id, packageName, deviceInfo, 'override_matched');
+                
+                // Increment install count
+                await incrementOverrideCount(override.id);
+                
+                return res.json({
+                    success: true,
+                    compatible: true,
+                    source: 'manual_override',
+                    downloadUrl: override.override.downloadUrl,
+                    packageName: packageName,
+                    appName: override.appName,
+                    version: override.override.version,
+                    format: override.override.format || 'APK',
+                    isOverride: true,
+                    overrideId: override.id,
+                    overrideNotes: override.metadata?.notes,
+                    expectedSize: override.override.fileSizeBytes || null,
+                    expectedHash: override.override.sha256Hash || null
+                });
+            } else {
+                console.log(`→ No override for this device, using APKPure...`);
+            }
+        }
+        
+        // ============================================================
+        // STEP 2: No override matched - Use APKPure (normal flow)
+        // ============================================================
         let appName = packageName;
-        let minSdkFromStore = null;
         
         try {
             const appInfo = await gplay.app({ appId: packageName });
             appName = appInfo.title || packageName;
-            if (appInfo.androidVersion && !appInfo.androidVersion.includes('Varies')) {
-                minSdkFromStore = androidVersionToApi(appInfo.androidVersion);
-            }
         } catch (e) {}
-
-        const needsOlder = deviceInfo.needsOlderVersion;
-
-        // ================================================================
-        // OLDER VERSION PATH - When client requests older version
-        // ================================================================
-        if (needsOlder && deviceInfo.apiLevel) {
-            console.log('→ Looking for older version...');
-            
-            // Check our hardcoded database first
-            const knownApp = OLDER_VERSIONS_DB[packageName];
-            if (knownApp && knownApp.olderVersions) {
-                // Find version that fits device's API level
-                const match = knownApp.olderVersions.find(v => 
-                    deviceInfo.apiLevel >= v.minApi && deviceInfo.apiLevel <= v.maxApi
-                );
-                
-                if (match) {
-                    console.log(`✓ Found hardcoded: v${match.version} for API ${deviceInfo.apiLevel}`);
-                    
-                    // Use proxy download
-                    const directUrl = `https://d.apkpure.net/b/APK/${packageName}?versionCode=${match.versionCode}`;
-                    const proxyUrl = `https://kosher-store-backend.onrender.com/proxy-download?url=${encodeURIComponent(directUrl)}&pkg=${packageName}&ver=${match.version}`;
-                    
-                    return res.json({
-                        success: true,
-                        compatible: true,
-                        source: 'older_version_db',
-                        downloadUrl: proxyUrl,
-                        packageName: packageName,
-                        appName: knownApp.name,
-                        version: match.version,
-                        minSdk: match.minApi,
-                        format: 'APK',
-                        isOlderVersion: true
-                    });
-                }
-            }
-            
-            // Try brute force version codes for unknown apps
-            console.log('→ Trying version codes...');
-            const olderResult = await tryOlderVersionCodes(packageName, deviceInfo.apiLevel);
-            if (olderResult) {
-                return res.json(olderResult);
-            }
-            
-            // Failed to find older version
-            console.log('✗ No older version found');
-            return res.json({
-                success: false,
-                compatible: false,
-                error: `Could not find an older version of ${appName} compatible with Android ${getAndroidVersionName(deviceInfo.apiLevel)}.`,
-                packageName: packageName,
-                appName: appName,
-                deviceApiLevel: deviceInfo.apiLevel
-            });
-        }
-
-        // ================================================================
-        // LATEST VERSION PATH
-        // ================================================================
-        console.log('→ Trying latest version...');
+        
+        console.log(`→ No override, trying latest version...`);
         
         // Try APKPure XAPK first
         const xapkUrl = `https://d.apkpure.com/b/XAPK/${packageName}?version=latest`;
@@ -180,16 +162,17 @@ app.get('/apk-url/:packageName', async (req, res) => {
                 headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
                 timeout: 10000
             });
-            console.log('✓ APKPure XAPK');
+            console.log('✓ APKPure XAPK available');
             return res.json({
                 success: true,
                 compatible: true,
                 source: 'apkpure',
                 downloadUrl: xapkUrl,
                 packageName: packageName,
+                appName: appName,
                 format: 'XAPK',
                 version: 'latest',
-                canRetryWithOlderVersion: true
+                isOverride: false
             });
         } catch (e) {}
         
@@ -197,20 +180,21 @@ app.get('/apk-url/:packageName', async (req, res) => {
         const apkUrl = `https://d.apkpure.com/b/APK/${packageName}?version=latest`;
         try {
             await axios.head(apkUrl, { headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 10000 });
-            console.log('✓ APKPure APK');
+            console.log('✓ APKPure APK available');
             return res.json({
                 success: true,
                 compatible: true,
                 source: 'apkpure',
                 downloadUrl: apkUrl,
                 packageName: packageName,
+                appName: appName,
                 format: 'APK',
                 version: 'latest',
-                canRetryWithOlderVersion: true
+                isOverride: false
             });
         } catch (e) {}
 
-        // Failed
+        // No source found
         console.log('✗ No source found');
         res.json({
             success: false,
@@ -225,97 +209,260 @@ app.get('/apk-url/:packageName', async (req, res) => {
 });
 
 // ============================================================
-// TRY OLDER VERSION CODES
+// FIND MATCHING OVERRIDE
 // ============================================================
 
-async function tryOlderVersionCodes(packageName, deviceApiLevel) {
-    const headers = {
-        'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36'
-    };
+async function findMatchingOverride(packageName, deviceInfo) {
+    if (!firebaseInitialized) return null;
     
-    // Common version code patterns to try
-    const versionCodes = [
-        '10243000', '10242000', '10241000', '10240000',
-        '10235000', '10230000', '10225000', '10220000',
-        '10215000', '10210000', '10205000', '10200000'
-    ];
-    
-    for (const code of versionCodes) {
-        const url = `https://d.apkpure.net/b/APK/${packageName}?versionCode=${code}`;
+    try {
+        const db = admin.database();
+        const snapshot = await db.ref('apk_overrides')
+            .orderByChild('packageName')
+            .equalTo(packageName)
+            .once('value');
         
-        try {
-            const resp = await axios.head(url, { 
-                headers, 
-                timeout: 5000,
-                validateStatus: s => s < 400 
-            });
+        if (!snapshot.exists()) return null;
+        
+        const overrides = [];
+        snapshot.forEach(child => {
+            const data = child.val();
+            data.id = child.key;
+            overrides.push(data);
+        });
+        
+        // Sort by specificity (more specific = higher priority)
+        overrides.sort((a, b) => {
+            return getSpecificityScore(b.targeting) - getSpecificityScore(a.targeting);
+        });
+        
+        // Find first matching override
+        for (const override of overrides) {
+            // Skip disabled overrides
+            if (override.status?.enabled === false) continue;
             
-            const size = parseInt(resp.headers['content-length'] || '0');
-            if (size > 1000000) { // > 1MB = real APK
-                console.log(`✓ Found version code ${code} (${Math.round(size/1024/1024)}MB)`);
-                
-                const proxyUrl = `https://kosher-store-backend.onrender.com/proxy-download?url=${encodeURIComponent(url)}&pkg=${packageName}&ver=${code}`;
-                
-                return {
-                    success: true,
-                    compatible: true,
-                    source: 'apkpure_versioncode',
-                    downloadUrl: proxyUrl,
-                    packageName: packageName,
-                    version: code,
-                    format: 'APK',
-                    isOlderVersion: true
-                };
+            // Check expiration
+            if (override.expiration?.expiresAt) {
+                if (Date.now() > override.expiration.expiresAt) continue;
             }
-        } catch (e) {}
+            
+            // Check if targeting matches
+            if (matchesTargeting(override.targeting, deviceInfo)) {
+                return override;
+            }
+        }
+        
+        return null;
+        
+    } catch (e) {
+        console.error('Override lookup error:', e.message);
+        return null;
+    }
+}
+
+function getSpecificityScore(targeting) {
+    if (!targeting) return 0;
+    let score = 0;
+    if (targeting.deviceModels?.length > 0) score += 100;
+    if (targeting.manufacturers?.length > 0) score += 50;
+    if (targeting.minApiLevel || targeting.maxApiLevel) score += 10;
+    return score;
+}
+
+function matchesTargeting(targeting, deviceInfo) {
+    if (!targeting) return true; // No targeting = matches all
+    
+    // Check API level range
+    if (targeting.minApiLevel && deviceInfo.apiLevel) {
+        if (deviceInfo.apiLevel < targeting.minApiLevel) return false;
+    }
+    if (targeting.maxApiLevel && deviceInfo.apiLevel) {
+        if (deviceInfo.apiLevel > targeting.maxApiLevel) return false;
     }
     
-    return null;
+    // Check device model (if specified)
+    if (targeting.deviceModels?.length > 0 && deviceInfo.model) {
+        const modelMatch = targeting.deviceModels.some(model =>
+            deviceInfo.model.toLowerCase().includes(model.toLowerCase()) ||
+            model.toLowerCase().includes(deviceInfo.model.toLowerCase())
+        );
+        if (!modelMatch) return false;
+    }
+    
+    // Check manufacturer (if specified)
+    if (targeting.manufacturers?.length > 0 && deviceInfo.manufacturer) {
+        const mfgMatch = targeting.manufacturers.some(mfg =>
+            deviceInfo.manufacturer.toLowerCase().includes(mfg.toLowerCase()) ||
+            mfg.toLowerCase().includes(deviceInfo.manufacturer.toLowerCase())
+        );
+        if (!mfgMatch) return false;
+    }
+    
+    return true;
 }
 
 // ============================================================
-// PROXY DOWNLOAD ENDPOINT
+// LOGGING
 // ============================================================
 
-app.get('/proxy-download', async (req, res) => {
-    const url = req.query.url;
-    const pkg = req.query.pkg || 'app';
-    const ver = req.query.ver || 'unknown';
-    
-    if (!url) {
-        return res.status(400).json({ error: 'Missing url' });
-    }
-    
-    console.log(`\n=== PROXY: ${pkg} v${ver} ===`);
-    console.log(`URL: ${url}`);
+async function logOverrideUsage(overrideId, packageName, deviceInfo, action, extra = {}) {
+    if (!firebaseInitialized) return;
     
     try {
-        const response = await axios({
-            method: 'GET',
-            url: url,
-            responseType: 'stream',
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36',
-                'Accept': '*/*'
-            },
-            timeout: 300000,
-            maxRedirects: 10
+        await admin.database().ref('apk_override_logs').push({
+            overrideId,
+            packageName,
+            deviceId: deviceInfo.deviceId || 'unknown',
+            deviceModel: deviceInfo.model || 'unknown',
+            deviceManufacturer: deviceInfo.manufacturer || 'unknown',
+            deviceApiLevel: deviceInfo.apiLevel || 0,
+            action,
+            timestamp: admin.database.ServerValue.TIMESTAMP,
+            ...extra
+        });
+    } catch (e) {
+        console.error('Log error:', e.message);
+    }
+}
+
+async function incrementOverrideCount(overrideId) {
+    if (!firebaseInitialized) return;
+    
+    try {
+        const ref = admin.database().ref(`apk_overrides/${overrideId}/status`);
+        await ref.update({
+            installCount: admin.database.ServerValue.increment(1),
+            lastInstalledAt: admin.database.ServerValue.TIMESTAMP
+        });
+    } catch (e) {
+        console.error('Increment error:', e.message);
+    }
+}
+
+// ============================================================
+// API ENDPOINTS FOR DASHBOARD
+// ============================================================
+
+// List all overrides
+app.get('/overrides', async (req, res) => {
+    if (!firebaseInitialized) {
+        return res.json({ success: false, error: 'Firebase not configured' });
+    }
+    
+    try {
+        const snapshot = await admin.database().ref('apk_overrides').once('value');
+        const overrides = [];
+        
+        snapshot.forEach(child => {
+            overrides.push({ id: child.key, ...child.val() });
         });
         
-        const filename = `${pkg}_${ver}.apk`;
-        res.setHeader('Content-Type', 'application/vnd.android.package-archive');
-        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.json({ success: true, overrides });
+    } catch (e) {
+        res.json({ success: false, error: e.message });
+    }
+});
+
+// Verify an APK URL
+app.post('/override/verify', async (req, res) => {
+    const { url } = req.body;
+    
+    if (!url) {
+        return res.json({ success: false, error: 'URL required' });
+    }
+    
+    try {
+        const response = await axios.head(url, {
+            timeout: 15000,
+            headers: { 
+                'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+                'Accept': '*/*'
+            },
+            maxRedirects: 5
+        });
         
-        if (response.headers['content-length']) {
-            res.setHeader('Content-Length', response.headers['content-length']);
-            console.log(`Size: ${Math.round(parseInt(response.headers['content-length'])/1024/1024)}MB`);
-        }
+        const contentLength = parseInt(response.headers['content-length'] || '0');
+        const contentType = response.headers['content-type'] || '';
         
-        response.data.pipe(res);
+        const isValidSize = contentLength > 1000000; // > 1MB
+        const isValidType = contentType.includes('octet-stream') || 
+                           contentType.includes('android') ||
+                           contentType.includes('application/vnd');
+        
+        const warnings = [];
+        if (!isValidSize) warnings.push(`File size (${Math.round(contentLength/1024)}KB) seems too small for an APK`);
+        if (!isValidType) warnings.push(`Content-Type "${contentType}" may not be an APK`);
+        
+        res.json({
+            success: true,
+            valid: isValidSize,
+            contentLength,
+            contentLengthMB: (contentLength / 1024 / 1024).toFixed(2),
+            contentType,
+            warnings
+        });
         
     } catch (error) {
-        console.error('Proxy error:', error.message);
-        res.status(500).json({ error: 'Download failed', message: error.message });
+        res.json({
+            success: false,
+            error: error.message,
+            warnings: ['URL is not accessible or returned an error']
+        });
+    }
+});
+
+// Log install result from phone
+app.post('/override/log', async (req, res) => {
+    if (!firebaseInitialized) {
+        return res.json({ success: false, error: 'Firebase not configured' });
+    }
+    
+    const { overrideId, packageName, deviceId, action, error, extra } = req.body;
+    
+    try {
+        await admin.database().ref('apk_override_logs').push({
+            overrideId: overrideId || null,
+            packageName: packageName || 'unknown',
+            deviceId: deviceId || 'unknown',
+            action: action || 'unknown',
+            error: error || null,
+            timestamp: admin.database.ServerValue.TIMESTAMP,
+            ...(extra || {})
+        });
+        
+        // Update failure count if install failed
+        if (action === 'install_failed' && overrideId) {
+            await admin.database().ref(`apk_overrides/${overrideId}/status/failureCount`)
+                .set(admin.database.ServerValue.increment(1));
+        }
+        
+        res.json({ success: true });
+    } catch (e) {
+        res.json({ success: false, error: e.message });
+    }
+});
+
+// Get override logs
+app.get('/override/:id/logs', async (req, res) => {
+    if (!firebaseInitialized) {
+        return res.json({ success: false, error: 'Firebase not configured' });
+    }
+    
+    try {
+        const snapshot = await admin.database().ref('apk_override_logs')
+            .orderByChild('overrideId')
+            .equalTo(req.params.id)
+            .limitToLast(100)
+            .once('value');
+        
+        const logs = [];
+        snapshot.forEach(child => {
+            logs.push({ id: child.key, ...child.val() });
+        });
+        
+        res.json({ success: true, logs: logs.reverse() });
+    } catch (e) {
+        res.json({ success: false, error: e.message });
     }
 });
 
@@ -336,15 +483,29 @@ app.get('/search/:query', async (req, res) => {
     try {
         const results = await gplay.search({ term: req.params.query, num: 20 });
         res.json({ success: true, results: results.map(a => ({
-            name: a.title, packageName: a.appId, developer: a.developer,
-            icon: a.icon, rating: a.score, installs: a.installs
+            name: a.title, 
+            packageName: a.appId, 
+            developer: a.developer,
+            icon: a.icon, 
+            rating: a.score, 
+            installs: a.installs,
+            androidVersion: a.androidVersion
         }))});
     } catch (error) {
         res.json({ success: false, error: error.message });
     }
 });
 
+// ============================================================
+// START SERVER
+// ============================================================
+
 app.listen(PORT, () => {
-    console.log(`Kosher Store Backend v4.5 on port ${PORT}`);
-    console.log('Older versions DB:', Object.keys(OLDER_VERSIONS_DB));
+    console.log(`\n🚀 Kosher Store Backend v5.0 running on port ${PORT}`);
+    console.log(`📱 Firebase: ${firebaseInitialized ? 'Connected' : 'Not configured'}`);
+    console.log(`\nEndpoints:`);
+    console.log(`  GET  /apk-url/:pkg?apiLevel=30&model=F21&manufacturer=DuoQin`);
+    console.log(`  GET  /overrides`);
+    console.log(`  POST /override/verify`);
+    console.log(`  POST /override/log`);
 });
