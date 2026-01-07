@@ -184,15 +184,18 @@ app.get('/apk-url/:packageName', async (req, res) => {
                 return res.json(result);
             }
             
-            // No older version found
-            console.log('✗ No compatible older version found');
+            // No older version found automatically - return APKMirror page as fallback
+            console.log('✗ No compatible older version found automatically');
+            console.log('  Returning APKMirror page URL as fallback');
             return res.json({
-                success: false,
-                compatible: false,
-                error: `${appName} requires a newer Android version than your device supports. No older compatible version was found.`,
+                success: true,
+                source: 'apkmirror_manual',
+                downloadUrl: `https://www.apkmirror.com/?post_type=app_release&searchtype=apk&s=${packageName}`,
                 packageName: packageName,
                 appName: appName,
-                deviceApiLevel: deviceInfo.apiLevel
+                compatible: true,
+                isOlderVersion: true,
+                note: 'Please select an older version compatible with your device from APKMirror'
             });
         }
 
