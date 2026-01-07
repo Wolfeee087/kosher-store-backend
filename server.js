@@ -14,8 +14,8 @@ app.use(express.json());
 app.get('/', (req, res) => {
     res.json({
         status: 'Kosher Store Backend Running',
-        version: '4.0.0',
-        features: ['Device-aware APK filtering', 'minSdk compatibility checks'],
+        version: '4.1.0',
+        features: ['Device-aware APK filtering', 'minSdk compatibility checks', 'FIXED: Returns failure for incompatible apps'],
         endpoints: [
             '/app/:packageName',
             '/search/:query',
@@ -157,13 +157,16 @@ app.get('/apk-url/:packageName', async (req, res) => {
         // First, try to get app info to check compatibility
         let appInfo = null;
         let minSdkFromStore = null;
+        let appName = packageName;
         
         try {
             appInfo = await gplay.app({ appId: packageName });
+            appName = appInfo.title || packageName;
             // androidVersion field contains minSdk requirement like "5.0" or "Varies with device"
             if (appInfo.androidVersion && !appInfo.androidVersion.includes('Varies')) {
                 // Parse "5.0" to API level 21, "11" to API 30, etc.
                 minSdkFromStore = androidVersionToApi(appInfo.androidVersion);
+                console.log(`Play Store says ${appName} requires Android ${appInfo.androidVersion} (API ${minSdkFromStore})`);
             }
         } catch (e) {
             console.log('Could not fetch Play Store info for compatibility check');
@@ -187,10 +190,20 @@ app.get('/apk-url/:packageName', async (req, res) => {
         console.log('Trying APKPure basic (latest version)...');
         result = await tryApkPureBasic(packageName);
         if (result.success) {
-            // Add compatibility warning if we know the app might be incompatible
+            // CRITICAL FIX: If we KNOW the app is incompatible, return FAILURE not success
+            // This prevents downloading 200MB only to fail at install time
             if (minSdkFromStore && deviceInfo.apiLevel && minSdkFromStore > deviceInfo.apiLevel) {
-                result.compatible = false;
-                result.compatibilityWarning = `This app requires Android ${getAndroidVersionName(minSdkFromStore)} (API ${minSdkFromStore}). Your device runs Android ${getAndroidVersionName(deviceInfo.apiLevel)} (API ${deviceInfo.apiLevel}).`;
+                console.log(`✗ INCOMPATIBLE: ${appName} requires API ${minSdkFromStore}, device has API ${deviceInfo.apiLevel}`);
+                return res.json({
+                    success: false,
+                    compatible: false,
+                    error: `${appName} requires Android ${getAndroidVersionName(minSdkFromStore)} (API ${minSdkFromStore}). Your device runs Android ${getAndroidVersionName(deviceInfo.apiLevel)} (API ${deviceInfo.apiLevel}).`,
+                    compatibilityWarning: `Requires Android ${getAndroidVersionName(minSdkFromStore)}+`,
+                    minSdk: minSdkFromStore,
+                    deviceApiLevel: deviceInfo.apiLevel,
+                    packageName: packageName,
+                    appName: appName
+                });
             }
             return res.json(result);
         }
@@ -199,6 +212,20 @@ app.get('/apk-url/:packageName', async (req, res) => {
         console.log('Trying APKCombo...');
         result = await tryApkCombo(packageName);
         if (result.success) {
+            // Also check compatibility for APKCombo
+            if (minSdkFromStore && deviceInfo.apiLevel && minSdkFromStore > deviceInfo.apiLevel) {
+                console.log(`✗ INCOMPATIBLE: ${appName} requires API ${minSdkFromStore}, device has API ${deviceInfo.apiLevel}`);
+                return res.json({
+                    success: false,
+                    compatible: false,
+                    error: `${appName} requires Android ${getAndroidVersionName(minSdkFromStore)} (API ${minSdkFromStore}). Your device runs Android ${getAndroidVersionName(deviceInfo.apiLevel)} (API ${deviceInfo.apiLevel}).`,
+                    compatibilityWarning: `Requires Android ${getAndroidVersionName(minSdkFromStore)}+`,
+                    minSdk: minSdkFromStore,
+                    deviceApiLevel: deviceInfo.apiLevel,
+                    packageName: packageName,
+                    appName: appName
+                });
+            }
             return res.json(result);
         }
 
@@ -573,14 +600,22 @@ app.get('/download-apk/:packageName', async (req, res) => {
     try {
         // If device info provided, check compatibility first
         if (deviceInfo.apiLevel) {
-            const apkInfo = await tryApkPureWithCompatibility(packageName, deviceInfo);
-            if (apkInfo.compatible === false) {
-                return res.status(400).json({
-                    error: 'Incompatible app',
-                    message: apkInfo.error || `This app is not compatible with Android API ${deviceInfo.apiLevel}`,
-                    deviceApiLevel: deviceInfo.apiLevel,
-                    deviceAndroidVersion: getAndroidVersionName(deviceInfo.apiLevel)
-                });
+            // Check Play Store for minSdk
+            try {
+                const appInfo = await gplay.app({ appId: packageName });
+                if (appInfo.androidVersion && !appInfo.androidVersion.includes('Varies')) {
+                    const minSdk = androidVersionToApi(appInfo.androidVersion);
+                    if (minSdk && minSdk > deviceInfo.apiLevel) {
+                        return res.status(400).json({
+                            error: 'Incompatible app',
+                            message: `${appInfo.title} requires Android ${getAndroidVersionName(minSdk)} (API ${minSdk}). Your device runs Android ${getAndroidVersionName(deviceInfo.apiLevel)} (API ${deviceInfo.apiLevel}).`,
+                            minSdk: minSdk,
+                            deviceApiLevel: deviceInfo.apiLevel
+                        });
+                    }
+                }
+            } catch (e) {
+                // Continue with download if we can't check
             }
         }
         
@@ -757,6 +792,6 @@ app.get('/check-compatibility/:packageName', async (req, res) => {
 });
 
 app.listen(PORT, () => {
-    console.log(`Kosher Store Backend v4.0 running on port ${PORT}`);
-    console.log('New features: Device-aware APK filtering, compatibility checks');
+    console.log(`Kosher Store Backend v4.1 running on port ${PORT}`);
+    console.log('FIXED: Now returns failure for incompatible apps instead of downloading them');
 });
