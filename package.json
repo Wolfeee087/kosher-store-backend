@@ -1,7 +1,7 @@
 {
   "name": "kosher-store-backend",
-  "version": "5.0.0",
-  "description": "Backend for Kosher Store APK distribution with manual override support",
+  "version": "6.0.0",
+  "description": "Simplified backend for Kosher Store - search and verification only",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
