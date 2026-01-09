@@ -99,6 +99,78 @@ app.get('/search/:query', async (req, res) => {
             fullDetail: false
         });
         
+        // Process results and fix missing package names
+        const processedResults = await Promise.all(
+            results.map(async (a, index) => {
+                // If package name is missing, try to get it from the URL or fetch details
+                let packageName = a.appId;
+                
+                // Method 1: Extract from URL
+                if (!packageName && a.url) {
+                    const match = a.url.match(/[?&]id=([^&]+)/);
+                    if (match) {
+                        packageName = match[1];
+                    }
+                }
+                
+                // Method 2: For first 5 results without package, fetch full details
+                if (!packageName && index < 5 && a.title) {
+                    try {
+                        // Search for this specific app by name
+                        const detailed = await gplay.search({
+                            term: a.title,
+                            num: 1,
+                            fullDetail: true
+                        });
+                        if (detailed[0] && detailed[0].appId) {
+                            packageName = detailed[0].appId;
+                        }
+                    } catch (e) {
+                        console.log(`Could not fetch details for: ${a.title}`);
+                    }
+                }
+                
+                return {
+                    name: a.title,
+                    packageName: packageName || null,
+                    developer: a.developer,
+                    icon: a.icon,
+                    rating: a.score,
+                    installs: a.installs,
+                    free: a.free,
+                    summary: a.summary,
+                    url: a.url || null
+                };
+            })
+        );
+        
+        // Sort: apps with package names first
+        const withPackage = processedResults.filter(r => r.packageName);
+        const withoutPackage = processedResults.filter(r => !r.packageName);
+        
+        res.json({ 
+            success: true, 
+            count: processedResults.length,
+            results: [...withPackage, ...withoutPackage]
+        });
+    } catch (error) {
+        console.error('Search error:', error.message);
+        res.json({ success: false, error: error.message, results: [] });
+    }
+});
+
+// ============================================================
+// SEARCH WITH FULL DETAILS (slower but complete)
+// ============================================================
+
+app.get('/search-full/:query', async (req, res) => {
+    try {
+        const results = await gplay.search({ 
+            term: req.params.query, 
+            num: 15,  // Fewer results since we fetch full details
+            fullDetail: true  // Get complete info including package name
+        });
+        
         res.json({ 
             success: true, 
             count: results.length,
@@ -110,12 +182,58 @@ app.get('/search/:query', async (req, res) => {
                 rating: a.score,
                 installs: a.installs,
                 free: a.free,
-                summary: a.summary
+                summary: a.summary,
+                version: a.version,
+                androidVersion: a.androidVersionText
             }))
         });
     } catch (error) {
         console.error('Search error:', error.message);
         res.json({ success: false, error: error.message, results: [] });
+    }
+});
+
+// ============================================================
+// LOOKUP PACKAGE NAME BY TITLE (for Add Manually button)
+// ============================================================
+
+app.get('/lookup/:title', async (req, res) => {
+    try {
+        const title = decodeURIComponent(req.params.title);
+        console.log(`Looking up package name for: "${title}"`);
+        
+        // Search with full details to get package name
+        const results = await gplay.search({
+            term: title,
+            num: 5,
+            fullDetail: true
+        });
+        
+        if (results.length === 0) {
+            return res.json({ success: false, error: 'App not found' });
+        }
+        
+        // Find best match by title
+        const exactMatch = results.find(r => 
+            r.title.toLowerCase() === title.toLowerCase()
+        );
+        
+        const match = exactMatch || results[0];
+        
+        res.json({
+            success: true,
+            app: {
+                name: match.title,
+                packageName: match.appId,
+                developer: match.developer,
+                icon: match.icon,
+                rating: match.score,
+                installs: match.installs
+            }
+        });
+    } catch (error) {
+        console.error('Lookup error:', error.message);
+        res.json({ success: false, error: error.message });
     }
 });
 
