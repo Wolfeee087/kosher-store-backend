@@ -1,5 +1,5 @@
 /**
- * Kosher Store Backend v6.1 - Simplified
+ * Kosher Store Backend v6.2 - Simplified
  * 
  * The app now handles APK URL resolution directly via Firebase.
  * This backend is only needed for:
@@ -12,7 +12,9 @@
  * - Backend wake detection (not needed anymore)
  * - Cold start delays affecting users
  * 
- * v6.1 FIX: Use fullDetail: true for search to always get package names
+ * v6.2 FIX: Multiple fallbacks for first result missing package name
+ *   - Extract from URL
+ *   - Use suggest API + lookup
  */
 
 const express = require('express');
@@ -62,7 +64,7 @@ initFirebase();
 app.get('/', (req, res) => {
     res.json({
         status: 'Kosher Store Backend Running',
-        version: '6.1.0',
+        version: '6.2.0',
         description: 'Simplified backend - app handles APK resolution directly via Firebase',
         features: [
             'App search (Google Play scraper)',
@@ -90,32 +92,95 @@ app.get('/ping', (req, res) => {
 });
 
 // ============================================================
+// DEBUG: See raw search results from scraper
+// ============================================================
+
+app.get('/debug-search/:query', async (req, res) => {
+    try {
+        const results = await gplay.search({ 
+            term: req.params.query, 
+            num: 5,
+            fullDetail: true
+        });
+        
+        // Return raw results so we can see what fields are available
+        res.json({ 
+            success: true, 
+            count: results.length,
+            rawResults: results.map((a, index) => ({
+                index,
+                appId: a.appId,
+                title: a.title,
+                url: a.url,
+                developer: a.developer,
+                // Show all keys available
+                availableKeys: Object.keys(a)
+            }))
+        });
+    } catch (error) {
+        res.json({ success: false, error: error.message });
+    }
+});
+
+// ============================================================
 // APP SEARCH (for Kosher Store browse/search)
 // ============================================================
 
 app.get('/search/:query', async (req, res) => {
     try {
-        // Use fullDetail: true to always get package names
-        // Slightly slower but guarantees we get appId for all results
         const results = await gplay.search({ 
             term: req.params.query, 
-            num: 20,  // Reduced from 30 since fullDetail is slower
+            num: 20,
             fullDetail: true
         });
         
-        res.json({ 
-            success: true, 
-            count: results.length,
-            results: results.map(a => ({
+        // Process results and fix missing package names
+        const processedResults = await Promise.all(results.map(async (a, index) => {
+            let packageName = a.appId;
+            
+            // Method 1: Extract from URL if available
+            if (!packageName && a.url) {
+                const match = a.url.match(/[?&]id=([^&]+)/);
+                if (match) packageName = match[1];
+            }
+            
+            // Method 2: For first result only, look up by exact title
+            if (!packageName && index === 0 && a.title) {
+                try {
+                    // Try to find the app using suggest API
+                    const suggestions = await gplay.suggest({ term: a.title });
+                    if (suggestions && suggestions.length > 0) {
+                        // Search for the first suggestion with full details
+                        const exactSearch = await gplay.search({
+                            term: suggestions[0],
+                            num: 1,
+                            fullDetail: true
+                        });
+                        if (exactSearch[0] && exactSearch[0].appId) {
+                            packageName = exactSearch[0].appId;
+                        }
+                    }
+                } catch (e) {
+                    console.log('Suggest lookup failed:', e.message);
+                }
+            }
+            
+            return {
                 name: a.title,
-                packageName: a.appId || null,
+                packageName: packageName || null,
                 developer: a.developer,
                 icon: a.icon,
                 rating: a.score,
                 installs: a.installs,
                 free: a.free,
                 summary: a.summary
-            }))
+            };
+        }));
+        
+        res.json({ 
+            success: true, 
+            count: processedResults.length,
+            results: processedResults
         });
     } catch (error) {
         console.error('Search error:', error.message);
@@ -436,7 +501,7 @@ app.get('/apk-url/:packageName', async (req, res) => {
 // ============================================================
 
 app.listen(PORT, () => {
-    console.log(`\n🚀 Kosher Store Backend v6.1 (Simplified) running on port ${PORT}`);
+    console.log(`\n🚀 Kosher Store Backend v6.2 running on port ${PORT}`);
     console.log(`📱 Firebase: ${firebaseInitialized ? 'Connected' : 'Not configured'}`);
     console.log(`\n📝 Note: APK resolution now handled by app directly`);
     console.log(`   This backend is only for search, verification, and logging\n`);
