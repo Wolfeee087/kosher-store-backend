@@ -99,59 +99,36 @@ app.get('/search/:query', async (req, res) => {
             fullDetail: false
         });
         
-        // Process results and fix missing package names
-        const processedResults = await Promise.all(
-            results.map(async (a, index) => {
-                // If package name is missing, try to get it from the URL or fetch details
-                let packageName = a.appId;
-                
-                // Method 1: Extract from URL
-                if (!packageName && a.url) {
-                    const match = a.url.match(/[?&]id=([^&]+)/);
-                    if (match) {
-                        packageName = match[1];
-                    }
+        // BUG FIX: First result from google-play-scraper always has missing appId
+        // Solution: Fetch full details for the first result
+        if (results.length > 0 && !results[0].appId) {
+            try {
+                const firstAppDetails = await gplay.search({
+                    term: results[0].title,
+                    num: 1,
+                    fullDetail: true
+                });
+                if (firstAppDetails[0] && firstAppDetails[0].appId) {
+                    results[0].appId = firstAppDetails[0].appId;
                 }
-                
-                // Method 2: For first 5 results without package, fetch full details
-                if (!packageName && index < 5 && a.title) {
-                    try {
-                        // Search for this specific app by name
-                        const detailed = await gplay.search({
-                            term: a.title,
-                            num: 1,
-                            fullDetail: true
-                        });
-                        if (detailed[0] && detailed[0].appId) {
-                            packageName = detailed[0].appId;
-                        }
-                    } catch (e) {
-                        console.log(`Could not fetch details for: ${a.title}`);
-                    }
-                }
-                
-                return {
-                    name: a.title,
-                    packageName: packageName || null,
-                    developer: a.developer,
-                    icon: a.icon,
-                    rating: a.score,
-                    installs: a.installs,
-                    free: a.free,
-                    summary: a.summary,
-                    url: a.url || null
-                };
-            })
-        );
-        
-        // Sort: apps with package names first
-        const withPackage = processedResults.filter(r => r.packageName);
-        const withoutPackage = processedResults.filter(r => !r.packageName);
+            } catch (e) {
+                console.log('Could not fetch first result details:', e.message);
+            }
+        }
         
         res.json({ 
             success: true, 
-            count: processedResults.length,
-            results: [...withPackage, ...withoutPackage]
+            count: results.length,
+            results: results.map(a => ({
+                name: a.title,
+                packageName: a.appId || null,
+                developer: a.developer,
+                icon: a.icon,
+                rating: a.score,
+                installs: a.installs,
+                free: a.free,
+                summary: a.summary
+            }))
         });
     } catch (error) {
         console.error('Search error:', error.message);
